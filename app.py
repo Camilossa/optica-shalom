@@ -15,6 +15,7 @@ import streamlit as st
 import holidays
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -241,35 +242,46 @@ def is_within_business_hours(dt_value: datetime) -> bool:
 
 
 def load_user_credentials() -> Credentials:
-    """Carga credenciales OAuth de usuario sin escribir token en disco."""
+    """Obtiene credenciales: usa service account si está configurada, si no flujo OAuth."""
 
-    client_file = os.getenv("GOOGLE_OAUTH_CLIENT_FILE") or os.getenv(
-        "GOOGLE_SERVICE_ACCOUNT_FILE"
-    )
-    raw_json = os.getenv("GOOGLE_OAUTH_CLIENT_JSON") or os.getenv(
-        "GOOGLE_SERVICE_ACCOUNT_JSON"
-    )
+    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    oauth_file = os.getenv("GOOGLE_OAUTH_CLIENT_FILE")
+    oauth_json = os.getenv("GOOGLE_OAUTH_CLIENT_JSON")
 
-    if not client_file and not raw_json:
-        raise ValueError(
-            "Configura GOOGLE_OAUTH_CLIENT_FILE (o JSON) para Calendar y Sheets"
-        )
+    if sa_json or sa_file:
+        try:
+            if sa_json:
+                info = json.loads(sa_json)
+                return service_account.Credentials.from_service_account_info(
+                    info, scopes=SCOPES
+                )
+            return service_account.Credentials.from_service_account_file(
+                sa_file, scopes=SCOPES
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON/FILE no es válido o no se pudo cargar"
+            ) from exc
 
     client_config: Optional[Dict] = None
-    if raw_json:
+    if oauth_json:
         try:
-            client_config = json.loads(raw_json)
+            client_config = json.loads(oauth_json)
         except json.JSONDecodeError as exc:  # noqa: BLE001
             raise ValueError("GOOGLE_OAUTH_CLIENT_JSON no es JSON válido") from exc
 
-    if not client_config and (not client_file or not os.path.exists(client_file)):
-        raise ValueError("No se encontró archivo de cliente OAuth")
+    if not client_config and (not oauth_file or not os.path.exists(oauth_file)):
+        raise ValueError(
+            "Configura GOOGLE_SERVICE_ACCOUNT_JSON/FILE o GOOGLE_OAUTH_CLIENT_FILE/JSON"
+        )
 
     flow = (
         InstalledAppFlow.from_client_config(client_config, SCOPES)
         if client_config
-        else InstalledAppFlow.from_client_secrets_file(client_file, SCOPES)
+        else InstalledAppFlow.from_client_secrets_file(oauth_file, SCOPES)
     )
+    # En cloud no hay navegador; este flujo es útil solo local. Preferir service account en despliegue.
     creds = flow.run_local_server(port=0)
     return creds
 
