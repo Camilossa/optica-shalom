@@ -3,6 +3,7 @@ import json
 import uuid
 import smtplib
 import ssl
+import re
 from email.message import EmailMessage
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
@@ -11,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import pytz
 import streamlit as st
+import holidays
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -26,6 +28,8 @@ HEADERS = [
     "name",
     "email",
     "phone",
+    "document",
+    "birthdate",
     "start_time_iso",
     "local_display",
     "status",
@@ -33,8 +37,11 @@ HEADERS = [
     "created_at_iso",
     "notes",
 ]
-BUSINESS_START_HOUR = 8
-BUSINESS_END_HOUR = 18
+SLOT_MINUTES = 15
+MORNING_START_HOUR = 8
+MORNING_END_HOUR = 12
+AFTERNOON_START_HOUR = 14
+AFTERNOON_END_HOUR = 18
 DEFAULT_DURATION_MINUTES = 30
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
@@ -50,8 +57,74 @@ def get_timezone() -> ZoneInfo:
 tz = get_timezone()
 
 
+def build_holiday_range_set(start: date, end: date) -> set:
+    years = list(range(start.year, end.year + 1))
+    co_holidays = holidays.country_holidays("CO", years=years)
+    return set(co_holidays.keys())
+
+
+def is_blocked_date(day: date) -> bool:
+    # Sunday or Colombia public holiday.
+    if day.weekday() == 6:
+        return True
+    # quick range covering the day year
+    holiday_set = build_holiday_range_set(day, day)
+    return day in holiday_set
+
+
+def date_choice_list(
+    start: date,
+    existing: List[Dict],
+    days: int = 120,
+    ignore_id: Optional[str] = None,
+) -> Tuple[List[Dict], int]:
+    end = start + timedelta(days=days)
+    holiday_set = build_holiday_range_set(start, end)
+    choices: List[Dict] = []
+    default_index = 0
+    for i in range(days + 1):
+        day = start + timedelta(days=i)
+        is_sunday = day.weekday() == 6
+        is_holiday = day in holiday_set
+        is_full = day_is_full(existing, day, ignore_id)
+        blocked = is_sunday or is_holiday or is_full
+        reason = (
+            "domingo"
+            if is_sunday
+            else "festivo"
+            if is_holiday
+            else "agenda completa"
+            if is_full
+            else ""
+        )
+        label = (
+            f"🔴 {day.isoformat()} ({reason})" if blocked else f"🟢 {day.isoformat()}"
+        )
+        choices.append(
+            {"date": day, "blocked": blocked, "label": label, "reason": reason}
+        )
+    for idx, choice in enumerate(choices):
+        if not choice["blocked"]:
+            default_index = idx
+            break
+    return choices, default_index
+
+
 def now_local() -> datetime:
     return datetime.now(tz)
+
+
+def is_valid_email(value: str) -> bool:
+    if not value:
+        return False
+    pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    return bool(re.match(pattern, value.strip()))
+
+
+def is_valid_phone_co(value: str) -> bool:
+    if not value:
+        return False
+    return bool(re.fullmatch(r"3\d{9}", value.strip()))
 
 
 def combine_datetime(selected_date: date, selected_time: time) -> datetime:
@@ -71,17 +144,31 @@ def parse_iso_datetime(value: str) -> Optional[datetime]:
 
 
 def generate_slots_for_date(selected_date: date) -> List[datetime]:
-    start_dt = datetime.combine(
-        selected_date, time(hour=BUSINESS_START_HOUR, minute=0), tzinfo=tz
-    )
-    end_dt = datetime.combine(
-        selected_date, time(hour=BUSINESS_END_HOUR, minute=0), tzinfo=tz
-    )
     slots: List[datetime] = []
-    current = start_dt
-    while current < end_dt:
+
+    morning_start = datetime.combine(
+        selected_date, time(hour=MORNING_START_HOUR, minute=0), tzinfo=tz
+    )
+    morning_end = datetime.combine(
+        selected_date, time(hour=MORNING_END_HOUR, minute=0), tzinfo=tz
+    )
+    afternoon_start = datetime.combine(
+        selected_date, time(hour=AFTERNOON_START_HOUR, minute=0), tzinfo=tz
+    )
+    afternoon_end = datetime.combine(
+        selected_date, time(hour=AFTERNOON_END_HOUR, minute=0), tzinfo=tz
+    )
+
+    current = morning_start
+    while current < morning_end:
         slots.append(current)
-        current += timedelta(minutes=30)
+        current += timedelta(minutes=SLOT_MINUTES)
+
+    current = afternoon_start
+    while current < afternoon_end:
+        slots.append(current)
+        current += timedelta(minutes=SLOT_MINUTES)
+
     return slots
 
 
@@ -114,6 +201,14 @@ def build_conflict_set(
     return conflicts
 
 
+def day_is_full(
+    existing: List[Dict], selected_date: date, ignore_id: Optional[str] = None
+) -> bool:
+    slots_in_day = len(generate_slots_for_date(selected_date))
+    conflicts = build_conflict_set(existing, selected_date, ignore_id)
+    return len(conflicts) >= slots_in_day
+
+
 def slot_choices(
     existing: List[Dict], selected_date: date, ignore_id: Optional[str] = None
 ) -> List[Dict]:
@@ -135,15 +230,18 @@ def slot_choices(
 
 
 def is_within_business_hours(dt_value: datetime) -> bool:
-    start_ok = dt_value.hour >= BUSINESS_START_HOUR
-    end_ok = dt_value.hour < BUSINESS_END_HOUR or (
-        dt_value.hour == BUSINESS_END_HOUR and dt_value.minute == 0
+    in_morning = MORNING_START_HOUR <= dt_value.hour < MORNING_END_HOUR
+    in_afternoon = AFTERNOON_START_HOUR <= dt_value.hour < AFTERNOON_END_HOUR
+    at_exact_end = (
+        dt_value.hour == AFTERNOON_END_HOUR
+        and dt_value.minute == 0
+        and dt_value.second == 0
     )
-    return start_ok and end_ok
+    return in_morning or in_afternoon or at_exact_end
 
 
 def load_user_credentials() -> Credentials:
-    """Carga credenciales OAuth de usuario. Usa archivo de cliente y guarda token renovable."""
+    """Carga credenciales OAuth de usuario sin escribir token en disco."""
 
     client_file = os.getenv("GOOGLE_OAUTH_CLIENT_FILE") or os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_FILE"
@@ -151,7 +249,6 @@ def load_user_credentials() -> Credentials:
     raw_json = os.getenv("GOOGLE_OAUTH_CLIENT_JSON") or os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_JSON"
     )
-    token_path = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", ".streamlit/oauth_token.json")
 
     if not client_file and not raw_json:
         raise ValueError(
@@ -168,27 +265,12 @@ def load_user_credentials() -> Credentials:
     if not client_config and (not client_file or not os.path.exists(client_file)):
         raise ValueError("No se encontró archivo de cliente OAuth")
 
-    creds: Optional[Credentials] = None
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-
-    if not creds or not creds.valid:
-        flow = (
-            InstalledAppFlow.from_client_config(client_config, SCOPES)
-            if client_config
-            else InstalledAppFlow.from_client_secrets_file(client_file, SCOPES)
-        )
-        creds = flow.run_local_server(port=0)
-
-        token_dir = os.path.dirname(token_path)
-        if token_dir:
-            os.makedirs(token_dir, exist_ok=True)
-        with open(token_path, "w", encoding="utf-8") as token_file:
-            token_file.write(creds.to_json())
-
+    flow = (
+        InstalledAppFlow.from_client_config(client_config, SCOPES)
+        if client_config
+        else InstalledAppFlow.from_client_secrets_file(client_file, SCOPES)
+    )
+    creds = flow.run_local_server(port=0)
     return creds
 
 
@@ -255,7 +337,7 @@ def fetch_appointments(sheets_service) -> List[Dict]:
     result = (
         sheets_service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{SHEET_NAME}!A2:J")
+        .get(spreadsheetId=spreadsheet_id, range=f"{SHEET_NAME}!A2:L")
         .execute()
     )
     rows = result.get("values", [])
@@ -288,7 +370,7 @@ def update_row(sheets_service, row_number: int, values: List[str]) -> None:
     if not spreadsheet_id:
         raise ValueError("Falta GOOGLE_SHEETS_SPREADSHEET_ID")
 
-    range_ref = f"{SHEET_NAME}!A{row_number}:J{row_number}"
+    range_ref = f"{SHEET_NAME}!A{row_number}:L{row_number}"
     sheets_service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=range_ref,
@@ -334,8 +416,45 @@ def send_email(to_email: str, subject: str, body: str) -> None:
         st.error(f"Error al enviar correo: {exc}")
 
 
+def email_subject() -> str:
+    return "Shalom Agendamiento de Citas"
+
+
+def email_body_created(name: str, appointment_id: str, start_dt: datetime) -> str:
+    return (
+        f"Hola {name or 'usuario'},\n\n"
+        f"Tu cita con ID {appointment_id} ha sido creada exitosamente.\n\n"
+        f"Fecha: {start_dt.strftime('%Y-%m-%d')}\n"
+        f"Hora: {start_dt.strftime('%I:%M %p (%Z)')}\n\n"
+        "Gracias por cuidar tu salud visual con nosotros."
+    )
+
+
+def email_body_updated(name: str, appointment_id: str, start_dt: datetime) -> str:
+    return (
+        f"Hola {name or 'usuario'},\n\n"
+        f"Tu cita con ID {appointment_id} ha sido reprogramada.\n\n"
+        f"Nueva fecha: {start_dt.strftime('%Y-%m-%d')}\n"
+        f"Nueva hora: {start_dt.strftime('%I:%M %p (%Z)')}\n\n"
+        "Gracias por cuidar tu salud visual con nosotros."
+    )
+
+
+def email_body_canceled(name: str, appointment_id: str, reason: str) -> str:
+    return (
+        f"Hola {name or 'usuario'},\n\n"
+        f"Tu cita con ID {appointment_id} ha sido cancelada.\n"
+        f"Motivo: {reason or 'No especificado'}\n\n"
+        "Si necesitas reprogramar, agenda un nuevo horario."
+    )
+
+
 def create_calendar_event(
-    calendar_service, summary: str, start_dt: datetime, duration_minutes: int
+    calendar_service,
+    summary: str,
+    start_dt: datetime,
+    duration_minutes: int,
+    attendee: Optional[str] = None,
 ) -> str:
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary")
     event_body = {
@@ -346,16 +465,22 @@ def create_calendar_event(
             "timeZone": str(tz),
         },
     }
+    if attendee:
+        event_body["attendees"] = [{"email": attendee}]
     event = (
         calendar_service.events()
-        .insert(calendarId=calendar_id, body=event_body, sendUpdates="none")
+        .insert(calendarId=calendar_id, body=event_body, sendUpdates="all")
         .execute()
     )
     return event.get("id", "")
 
 
 def update_calendar_event(
-    calendar_service, event_id: str, start_dt: datetime, duration_minutes: int
+    calendar_service,
+    event_id: str,
+    start_dt: datetime,
+    duration_minutes: int,
+    attendee: Optional[str] = None,
 ) -> None:
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary")
     body = {
@@ -365,15 +490,17 @@ def update_calendar_event(
             "timeZone": str(tz),
         },
     }
+    if attendee:
+        body["attendees"] = [{"email": attendee}]
     calendar_service.events().patch(
-        calendarId=calendar_id, eventId=event_id, body=body, sendUpdates="none"
+        calendarId=calendar_id, eventId=event_id, body=body, sendUpdates="all"
     ).execute()
 
 
 def delete_calendar_event(calendar_service, event_id: str) -> None:
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary")
     calendar_service.events().delete(
-        calendarId=calendar_id, eventId=event_id, sendUpdates="none"
+        calendarId=calendar_id, eventId=event_id, sendUpdates="all"
     ).execute()
 
 
@@ -408,9 +535,10 @@ def filter_by_email(existing: List[Dict], email: str) -> List[Dict]:
 
 
 def render_header():
-    st.title("Agendamiento de Citas")
-    st.caption("Horarios: 8:00 am a 6:00 pm (UTC-5)")
-    st.info("No se permiten citas en el pasado y no se duplican horarios.")
+    st.title("Bienvenido a Optica Shalom Agendamiento de Citas")
+    st.caption(
+        "Horarios de atención: Lunes-Sábado de 8:00 am a 12:00 pm y 2:00 pm a 6:00 pm"
+    )
 
 
 def render_sidebar_status():
@@ -427,24 +555,86 @@ def handle_booking(existing: List[Dict]) -> None:
         name = st.text_input("Nombre", max_chars=80)
         email = st.text_input("Email")
         phone = st.text_input("Teléfono", max_chars=30)
-        selected_date = st.date_input("Fecha", min_value=date.today())
+        document = st.text_input("Cédula", max_chars=30)
+        today = date.today()
+        min_birthdate = date(1910, 1, 1)
+        max_birthdate = today - timedelta(days=7 * 365)
+        birthdate = st.date_input(
+            "Fecha de nacimiento",
+            value=max_birthdate,
+            min_value=min_birthdate,
+            max_value=max_birthdate,
+            format="YYYY-MM-DD",
+        )
+        date_choices, default_idx = date_choice_list(date.today(), existing)
+        selected_date_choice = st.selectbox(
+            "Fecha",
+            options=date_choices,
+            format_func=lambda item: item["label"],
+            index=default_idx,
+            key="date_booking",
+            help="Días disponibles (🟢) excluyen domingos y festivos (🔴).",
+        )
+        selected_date = selected_date_choice["date"]
+        if selected_date_choice["blocked"]:
+            st.error("No se permite agendar domingos ni festivos en Colombia.")
+            submitted = st.form_submit_button("Agendar cita")
+            return
         slots_info = slot_choices(existing, selected_date)
         selected_slot_info = st.selectbox(
             "Hora",
             options=slots_info,
             format_func=lambda item: item["label"],
             key=f"slot_booking_{selected_date.isoformat()}",
-            help="Slots de 30 minutos entre 8am y 6pm (🟢 disponibles / 🔴 ocupados)",
+            help=(
+                "Slots de 15 minutos en 8am-12pm y 2pm-6pm "
+                "(🟢 disponibles / 🔴 ocupados)"
+            ),
         )
         if selected_slot_info and selected_slot_info["status"] == "free":
             selected_slot = selected_slot_info["dt"]
         else:
             selected_slot = None
             st.warning("Selecciona un horario disponible (verde).")
-        reason = st.text_area("Motivo / notas", max_chars=300)
         submitted = st.form_submit_button("Agendar cita")
 
     if not submitted:
+        return
+
+    if not name.strip():
+        st.error("El nombre es obligatorio.")
+        return
+
+    if not email.strip():
+        st.error("El email es obligatorio.")
+        return
+
+    if not is_valid_email(email):
+        st.error("Ingresa un email válido.")
+        return
+
+    if not phone.strip():
+        st.error("El teléfono es obligatorio.")
+        return
+
+    if not is_valid_phone_co(phone):
+        st.error("El teléfono debe iniciar en 3 y tener 10 dígitos (Colombia).")
+        return
+
+    if not document:
+        st.error("La cédula es obligatoria.")
+        return
+
+    if not birthdate:
+        st.error("La fecha de nacimiento es obligatoria.")
+        return
+
+    if birthdate < min_birthdate:
+        st.error("La fecha de nacimiento no puede ser anterior a 1910.")
+        return
+
+    if birthdate > max_birthdate:
+        st.error("Solo se permiten usuarios de 7 años o más.")
         return
 
     if not selected_slot:
@@ -469,7 +659,11 @@ def handle_booking(existing: List[Dict]) -> None:
         appointment_id = str(uuid.uuid4())
         summary = f"Cita con {name}" if name else "Cita"
         event_id = create_calendar_event(
-            calendar_service, summary, start_dt, DEFAULT_DURATION_MINUTES
+            calendar_service,
+            summary,
+            start_dt,
+            DEFAULT_DURATION_MINUTES,
+            attendee=email,
         )
 
         created_at = now_local().isoformat()
@@ -478,20 +672,19 @@ def handle_booking(existing: List[Dict]) -> None:
             name,
             email,
             phone,
+            document,
+            birthdate.isoformat() if birthdate else "",
             start_iso,
             format_local(start_dt),
             "active",
             event_id,
             created_at,
-            reason,
+            "",
         ]
         append_appointment(sheets_service, values)
 
-        email_body = (
-            f"Hola {name or ''}, tu cita está agendada el {format_local(start_dt)}. "
-            f"ID: {appointment_id}\nMotivo: {reason}"
-        )
-        send_email(email, "Confirmación de cita", email_body)
+        email_body = email_body_created(name, appointment_id, start_dt)
+        send_email(email, email_subject(), email_body)
         st.success(f"Cita agendada. ID: {appointment_id}")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Error al agendar: {exc}")
@@ -523,9 +716,22 @@ def handle_update(existing: List[Dict], user_rows: List[Dict]) -> None:
     if not selected_id:
         return
 
-    selected_date = st.date_input(
-        "Nueva fecha", min_value=date.today(), key="update_date"
+    date_choices, default_idx = date_choice_list(
+        date.today(), existing, ignore_id=selected_id
     )
+    selected_date_choice = st.selectbox(
+        "Nueva fecha",
+        options=date_choices,
+        format_func=lambda item: item["label"],
+        index=default_idx,
+        key=f"update_date_{selected_id}",
+        help="Días disponibles (🟢) excluyen domingos y festivos (🔴).",
+    )
+    selected_date = selected_date_choice["date"]
+
+    if selected_date_choice["blocked"]:
+        st.error("No se permite agendar domingos ni festivos en Colombia.")
+        return
 
     slots_info = slot_choices(existing, selected_date, ignore_id=selected_id)
     selected_slot_info = st.selectbox(
@@ -533,7 +739,9 @@ def handle_update(existing: List[Dict], user_rows: List[Dict]) -> None:
         options=slots_info,
         format_func=lambda item: item["label"],
         key=f"update_time_{selected_id}_{selected_date.isoformat()}",
-        help="Slots de 30 minutos entre 8am y 6pm (🟢 disponibles / 🔴 ocupados)",
+        help=(
+            "Slots de 15 minutos en 8am-12pm y 2pm-6pm (🟢 disponibles / 🔴 ocupados)"
+        ),
     )
     if selected_slot_info and selected_slot_info["status"] == "free":
         selected_slot = selected_slot_info["dt"]
@@ -569,7 +777,11 @@ def handle_update(existing: List[Dict], user_rows: List[Dict]) -> None:
             event_id = target.get("calendar_event_id", "")
             if event_id:
                 update_calendar_event(
-                    calendar_service, event_id, start_dt, DEFAULT_DURATION_MINUTES
+                    calendar_service,
+                    event_id,
+                    start_dt,
+                    DEFAULT_DURATION_MINUTES,
+                    attendee=target.get("email", ""),
                 )
 
             updated_row = [
@@ -577,6 +789,8 @@ def handle_update(existing: List[Dict], user_rows: List[Dict]) -> None:
                 target.get("name", ""),
                 target.get("email", ""),
                 target.get("phone", ""),
+                target.get("document", ""),
+                target.get("birthdate", ""),
                 start_iso,
                 format_local(start_dt),
                 "active",
@@ -586,10 +800,10 @@ def handle_update(existing: List[Dict], user_rows: List[Dict]) -> None:
             ]
             update_row(sheets_service, idx + 2, updated_row)
 
-            email_body = (
-                f"Tu cita {selected_id} fue reprogramada a {format_local(start_dt)}."
+            email_body = email_body_updated(
+                target.get("name", ""), selected_id, start_dt
             )
-            send_email(target.get("email", ""), "Cita reprogramada", email_body)
+            send_email(target.get("email", ""), email_subject(), email_body)
             st.success("Cita actualizada.")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Error al actualizar: {exc}")
@@ -621,6 +835,8 @@ def handle_cancel(existing: List[Dict], user_rows: List[Dict]) -> None:
                 target.get("name", ""),
                 target.get("email", ""),
                 target.get("phone", ""),
+                target.get("document", ""),
+                target.get("birthdate", ""),
                 target.get("start_time_iso", ""),
                 target.get("local_display", ""),
                 "canceled",
@@ -630,8 +846,10 @@ def handle_cancel(existing: List[Dict], user_rows: List[Dict]) -> None:
             ]
             update_row(sheets_service, idx + 2, canceled_row)
 
-            email_body = f"Tu cita {selected_id} fue cancelada. Motivo: {reason}"
-            send_email(target.get("email", ""), "Cita cancelada", email_body)
+            email_body = email_body_canceled(
+                target.get("name", ""), selected_id, reason
+            )
+            send_email(target.get("email", ""), email_subject(), email_body)
             st.success("Cita cancelada.")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Error al cancelar: {exc}")
@@ -644,9 +862,15 @@ def main():
     try:
         _, sheets_service = get_google_services()
         appointments = fetch_appointments(sheets_service)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         appointments = []
-        st.warning("Configura Google APIs para habilitar agenda persistente.")
+        st.warning(
+            f"Configura Google APIs para habilitar agenda persistente. Detalle: {exc}"
+        )
+        if st.button("Reintentar autenticación Google"):
+            st.info(
+                "Se solicitará autenticación nuevamente. Recarga la página y autoriza cuando se abra el navegador."
+            )
 
     tabs = st.tabs(["Agendar", "Mis citas"])
 
