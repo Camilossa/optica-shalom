@@ -1,0 +1,24 @@
+[project]
+name = "agendamiento-citas"
+version = "0.1.0"
+description = "Streamlit app for appointment scheduling with Google Calendar, Sheets, and Gmail notifications."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Your Name" }]
+dependencies = [
+  "streamlit>=1.39",
+  "google-api-python-client>=2.154",
+  "google-auth>=2.26",
+  "google-auth-httplib2>=0.2.0",
+  "google-auth-oauthlib>=1.2.0",
+  "pytz>=2024.1",
+  "python-dotenv>=1.0.1",
+  "pandas>=2.2.2",
+  "rich>=13.7.1"
+]
+
+[project.optional-dependencies]
+dev = ["ipykernel"]
+
+[tool.uv]
+package = true

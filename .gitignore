@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+
+# UV
+.uv/
