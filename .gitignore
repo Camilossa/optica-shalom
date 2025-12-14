@@ -13,3 +13,5 @@ __pycache__/
 
 # UV
 .uv/
+
+oauth_credentials.json
