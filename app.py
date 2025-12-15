@@ -48,6 +48,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
+DISABLE_ATTENDEE_INVITES = os.getenv("DISABLE_ATTENDEE_INVITES", "1") == "1"
 
 
 def get_timezone() -> ZoneInfo:
@@ -529,11 +530,15 @@ def create_calendar_event(
             "timeZone": str(tz),
         },
     }
-    if attendee:
+    if attendee and not DISABLE_ATTENDEE_INVITES:
         event_body["attendees"] = [{"email": attendee}]
     event = (
         calendar_service.events()
-        .insert(calendarId=calendar_id, body=event_body, sendUpdates="all")
+        .insert(
+            calendarId=calendar_id,
+            body=event_body,
+            sendUpdates="none" if DISABLE_ATTENDEE_INVITES else "all",
+        )
         .execute()
     )
     return event.get("id", "")
@@ -554,10 +559,13 @@ def update_calendar_event(
             "timeZone": str(tz),
         },
     }
-    if attendee:
+    if attendee and not DISABLE_ATTENDEE_INVITES:
         body["attendees"] = [{"email": attendee}]
     calendar_service.events().patch(
-        calendarId=calendar_id, eventId=event_id, body=body, sendUpdates="all"
+        calendarId=calendar_id,
+        eventId=event_id,
+        body=body,
+        sendUpdates="none" if DISABLE_ATTENDEE_INVITES else "all",
     ).execute()
 
 
