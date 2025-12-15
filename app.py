@@ -613,15 +613,6 @@ def render_header():
     )
 
 
-def render_sidebar_status():
-    try:
-        calendar_service, sheets_service = get_google_services()
-        if calendar_service and sheets_service:
-            st.sidebar.success("Conectado a Google APIs")
-    except Exception as exc:  # noqa: BLE001
-        st.sidebar.error(f"Google APIs no configuradas: {exc}")
-
-
 def handle_booking(existing: List[Dict]) -> None:
     with st.form("book_form"):
         name = st.text_input("Nombre", max_chars=80)
@@ -943,7 +934,6 @@ def handle_cancel(existing: List[Dict], user_rows: List[Dict]) -> None:
 
 def main():
     render_header()
-    render_sidebar_status()
 
     try:
         _, sheets_service = get_google_services()
