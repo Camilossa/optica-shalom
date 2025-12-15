@@ -43,7 +43,7 @@ MORNING_START_HOUR = 8
 MORNING_END_HOUR = 12
 AFTERNOON_START_HOUR = 14
 AFTERNOON_END_HOUR = 18
-DEFAULT_DURATION_MINUTES = 30
+DEFAULT_DURATION_MINUTES = SLOT_MINUTES
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -144,6 +144,16 @@ def parse_iso_datetime(value: str) -> Optional[datetime]:
         return None
 
 
+def parse_google_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        cleaned = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned).astimezone(tz)
+    except ValueError:
+        return None
+
+
 def generate_slots_for_date(selected_date: date) -> List[datetime]:
     slots: List[datetime] = []
 
@@ -200,6 +210,48 @@ def build_conflict_set(
             )
             conflicts.add(stamp)
     return conflicts
+
+
+def calendar_has_conflict(
+    calendar_service,
+    start_dt: datetime,
+    duration_minutes: int,
+    ignore_event_id: Optional[str] = None,
+) -> bool:
+    """Verifica conflictos directos en Calendar para el slot indicado."""
+
+    calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+    window_start = start_dt - timedelta(minutes=duration_minutes)
+    window_end = start_dt + timedelta(minutes=duration_minutes)
+
+    events = (
+        calendar_service.events()
+        .list(
+            calendarId=calendar_id,
+            timeMin=window_start.isoformat(),
+            timeMax=window_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=10,
+        )
+        .execute()
+    )
+
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+
+    for ev in events.get("items", []):
+        if ignore_event_id and ev.get("id") == ignore_event_id:
+            continue
+        start_str = ev.get("start", {}).get("dateTime")
+        end_str = ev.get("end", {}).get("dateTime")
+        ev_start = parse_google_datetime(start_str)
+        ev_end = parse_google_datetime(end_str)
+        if not ev_start or not ev_end:
+            continue
+        # Overlap: ev_start < desired_end and ev_end > desired_start
+        if ev_start < end_dt and ev_end > start_dt:
+            return True
+    return False
 
 
 def day_is_full(
@@ -668,6 +720,11 @@ def handle_booking(existing: List[Dict]) -> None:
 
     try:
         calendar_service, sheets_service = get_google_services()
+
+        if calendar_has_conflict(calendar_service, start_dt, DEFAULT_DURATION_MINUTES):
+            st.error("Este horario ya fue ocupado. Selecciona otro.")
+            return
+
         appointment_id = str(uuid.uuid4())
         summary = f"Cita con {name}" if name else "Cita"
         event_id = create_calendar_event(
@@ -787,6 +844,15 @@ def handle_update(existing: List[Dict], user_rows: List[Dict]) -> None:
         try:
             calendar_service, sheets_service = get_google_services()
             event_id = target.get("calendar_event_id", "")
+            if calendar_has_conflict(
+                calendar_service,
+                start_dt,
+                DEFAULT_DURATION_MINUTES,
+                ignore_event_id=event_id or None,
+            ):
+                st.error("Este horario ya fue ocupado. Selecciona otro.")
+                return
+
             if event_id:
                 update_calendar_event(
                     calendar_service,
